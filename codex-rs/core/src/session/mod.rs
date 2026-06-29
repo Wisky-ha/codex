@@ -122,6 +122,7 @@ use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnContextItem;
@@ -416,8 +417,10 @@ pub(crate) struct CodexSpawnArgs {
     pub(crate) skills_service: Arc<SkillsService>,
     pub(crate) plugins_manager: Arc<PluginsManager>,
     pub(crate) mcp_manager: Arc<McpManager>,
+    pub(crate) code_mode_session_provider: Arc<dyn codex_code_mode::CodeModeSessionProvider>,
     pub(crate) extensions: Arc<codex_extension_api::ExtensionRegistry<crate::config::Config>>,
     pub(crate) conversation_history: InitialHistory,
+    pub(crate) requested_history_mode: Option<ThreadHistoryMode>,
     pub(crate) session_source: SessionSource,
     pub(crate) forked_from_thread_id: Option<ThreadId>,
     pub(crate) parent_thread_id: Option<ThreadId>,
@@ -506,8 +509,10 @@ impl Codex {
             skills_service,
             plugins_manager,
             mcp_manager,
+            code_mode_session_provider,
             extensions,
             conversation_history,
+            requested_history_mode,
             session_source,
             forked_from_thread_id,
             parent_thread_id,
@@ -598,6 +603,9 @@ impl Codex {
             .await;
         let multi_agent_version =
             resolve_multi_agent_version(&conversation_history, inherited_multi_agent_version);
+        let history_mode = conversation_history.get_history_mode(
+            requested_history_mode.unwrap_or_else(|| thread_store.default_history_mode()),
+        );
         config
             .validate_multi_agent_v2_config()
             .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?;
@@ -653,6 +661,7 @@ impl Codex {
             app_server_client_name: None,
             app_server_client_version: None,
             session_source,
+            history_mode,
             forked_from_thread_id,
             parent_thread_id,
             thread_source,
@@ -680,6 +689,7 @@ impl Codex {
             skills_service,
             plugins_manager,
             mcp_manager.clone(),
+            code_mode_session_provider,
             extensions,
             thread_extension_init,
             supports_openai_form_elicitation,
@@ -3249,7 +3259,10 @@ impl Session {
             );
             if let Some(available_skills) = available_skills {
                 let warning_message = available_skills.warning_message.clone();
-                let skills_instructions = AvailableSkillsInstructions::from(available_skills);
+                let skills_instructions = AvailableSkillsInstructions::from_available_skills(
+                    &available_skills,
+                    turn_context.model_info.include_skills_usage_instructions,
+                );
                 if let Some(warning_message) = warning_message {
                     self.send_event_raw(Event {
                         id: String::new(),
