@@ -134,12 +134,16 @@ pub fn from_responses_request(req: &ResponsesApiRequest) -> ChatCompletionReques
     for item in &req.input {
         match item {
             ResponseItem::Message { role, content, .. } => {
+                // Reasoning only merges into assistant messages;
+                // non-assistant messages clear pending reasoning (orphaned)
+                let role_is_assistant = role == "assistant";
+                let reasoning = if role_is_assistant { pending_reasoning.take() } else { pending_reasoning.take(); None };
                 let chat_msg = ChatMessage {
                     role: role.clone(),
                     content: flatten_content(content),
                     tool_calls: None,
                     tool_call_id: None,
-                    reasoning_content: pending_reasoning.take(),
+                    reasoning_content: reasoning,
                 };
                 messages.push(chat_msg);
             }
@@ -381,5 +385,545 @@ impl<T: HttpTransport> ChatClient<T> {
             self.session.provider().stream_idle_timeout,
             self.sse_telemetry.clone(),
         ))
+    }
+}
+
+// ── Tests ──
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_protocol::models::FunctionCallOutputBody;
+    use codex_protocol::models::FunctionCallOutputPayload;
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
+
+    /// Helper: build a ResponsesApiRequest with given instructions + input items.
+    fn make_request(instructions: &str, input: Vec<ResponseItem>, tools: Option<Vec<serde_json::Value>>) -> ResponsesApiRequest {
+        ResponsesApiRequest {
+            model: "deepseek-v4-flash".to_string(),
+            instructions: instructions.to_string(),
+            input,
+            tools,
+            tool_choice: "auto".to_string(),
+            parallel_tool_calls: true,
+            reasoning: None,
+            store: false,
+            stream: true,
+            include: vec![],
+            service_tier: None,
+            prompt_cache_key: None,
+            text: None,
+            client_metadata: None,
+        }
+    }
+
+    #[test]
+    fn text_instructions_becomes_system_message() {
+        let req = make_request("You are a helpful assistant.", vec![], None);
+        let chat = from_responses_request(&req);
+
+        assert_eq!(chat.model, "deepseek-v4-flash");
+        assert!(chat.stream);
+        assert!(chat.thinking.is_some());
+        assert_eq!(chat.thinking.as_ref().unwrap().r#type, "enabled");
+        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(chat.messages[0].role, "system");
+        match &chat.messages[0].content {
+            ChatContent::Text(t) => assert_eq!(t, "You are a helpful assistant."),
+            _ => panic!("expected Text content"),
+        }
+    }
+
+    #[test]
+    fn empty_instructions_skips_system_message() {
+        let req = make_request("", vec![], None);
+        let chat = from_responses_request(&req);
+        assert_eq!(chat.messages.len(), 0);
+    }
+
+    #[test]
+    fn user_message_converts_role_and_text_content() {
+        let items = vec![
+            ResponseItem::Message {
+                id: Some("msg_1".into()),
+                role: "user".into(),
+                content: vec![ContentItem::InputText { text: "Hello".into() }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ];
+        let req = make_request("", items, None);
+        let chat = from_responses_request(&req);
+
+        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(chat.messages[0].role, "user");
+        match &chat.messages[0].content {
+            ChatContent::Text(t) => assert_eq!(t, "Hello"),
+            _ => panic!("expected Text"),
+        }
+        assert!(chat.messages[0].tool_calls.is_none());
+    }
+
+    #[test]
+    fn multiple_text_content_items_are_joined() {
+        let items = vec![
+            ResponseItem::Message {
+                id: Some("msg_1".into()),
+                role: "user".into(),
+                content: vec![
+                    ContentItem::InputText { text: "Hello".into() },
+                    ContentItem::InputText { text: "World".into() },
+                ],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ];
+        let req = make_request("", items, None);
+        let chat = from_responses_request(&req);
+        match &chat.messages[0].content {
+            ChatContent::Text(t) => assert_eq!(t, "Hello\nWorld"),
+            _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
+    fn output_text_in_user_message_still_works() {
+        let items = vec![
+            ResponseItem::Message {
+                id: Some("msg_1".into()),
+                role: "user".into(),
+                content: vec![ContentItem::OutputText { text: "result".into() }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ];
+        let req = make_request("", items, None);
+        let chat = from_responses_request(&req);
+        assert_eq!(chat.messages.len(), 1);
+        match &chat.messages[0].content {
+            ChatContent::Text(t) => assert_eq!(t, "result"),
+            _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
+    fn assistant_message_converts_role_and_text() {
+        let items = vec![
+            ResponseItem::Message {
+                id: Some("msg_2".into()),
+                role: "assistant".into(),
+                content: vec![ContentItem::OutputText { text: "I think...".into() }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ];
+        let req = make_request("", items, None);
+        let chat = from_responses_request(&req);
+
+        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(chat.messages[0].role, "assistant");
+        match &chat.messages[0].content {
+            ChatContent::Text(t) => assert_eq!(t, "I think..."),
+            _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
+    fn function_call_merges_into_previous_assistant() {
+        let items = vec![
+            ResponseItem::Message {
+                id: Some("msg_1".into()),
+                role: "assistant".into(),
+                content: vec![ContentItem::OutputText { text: "Let me check".into() }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::FunctionCall {
+                id: Some("fc_1".into()),
+                name: "read_file".into(),
+                namespace: None,
+                arguments: r#"{"path":"/etc/hosts"}"#.into(),
+                call_id: "call_abc".into(),
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ];
+        let req = make_request("", items, None);
+        let chat = from_responses_request(&req);
+
+        // Should produce 1 assistant message with both text and tool_calls
+        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(chat.messages[0].role, "assistant");
+        let tool_calls = chat.messages[0].tool_calls.as_ref().expect("expected tool_calls");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_abc");
+        assert_eq!(tool_calls[0].function.name, "read_file");
+        assert_eq!(tool_calls[0].function.arguments, r#"{"path":"/etc/hosts"}"#);
+    }
+
+    #[test]
+    fn function_call_without_prior_assistant_creates_new_one() {
+        let items = vec![
+            ResponseItem::FunctionCall {
+                id: Some("fc_1".into()),
+                name: "search".into(),
+                namespace: None,
+                arguments: r#"{"q":"weather"}"#.into(),
+                call_id: "call_1".into(),
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ];
+        let req = make_request("", items, None);
+        let chat = from_responses_request(&req);
+
+        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(chat.messages[0].role, "assistant");
+        assert_eq!(chat.messages[0].tool_calls.as_ref().unwrap().len(), 1);
+        assert_eq!(chat.messages[0].tool_calls.as_ref().unwrap()[0].function.name, "search");
+    }
+
+    #[test]
+    fn multiple_function_calls_all_in_one_assistant() {
+        let items = vec![
+            ResponseItem::FunctionCall {
+                id: Some("fc_1".into()),
+                name: "read_file".into(),
+                namespace: None,
+                arguments: r#"{"path":"a"}"#.into(),
+                call_id: "call_1".into(),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::FunctionCall {
+                id: Some("fc_2".into()),
+                name: "write_file".into(),
+                namespace: None,
+                arguments: r#"{"path":"b","content":"c"}"#.into(),
+                call_id: "call_2".into(),
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ];
+        let req = make_request("", items, None);
+        let chat = from_responses_request(&req);
+
+        assert_eq!(chat.messages.len(), 1);
+        let calls = chat.messages[0].tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].function.name, "read_file");
+        assert_eq!(calls[1].function.name, "write_file");
+    }
+
+    #[test]
+    fn custom_tool_call_is_treated_like_function_call() {
+        let items = vec![
+            ResponseItem::CustomToolCall {
+                id: Some("ctc_1".into()),
+                status: Some("completed".into()),
+                call_id: "call_ctc".into(),
+                name: "custom_tool".into(),
+                input: r#"{"key":"val"}"#.into(),
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ];
+        let req = make_request("", items, None);
+        let chat = from_responses_request(&req);
+
+        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(chat.messages[0].role, "assistant");
+        let calls = chat.messages[0].tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "custom_tool");
+        assert_eq!(calls[0].function.arguments, r#"{"key":"val"}"#);
+    }
+
+    #[test]
+    fn function_call_output_becomes_tool_message() {
+        let items = vec![
+            ResponseItem::FunctionCallOutput {
+                id: Some("fco_1".into()),
+                call_id: "call_1".into(),
+                output: FunctionCallOutputPayload {
+                    body: FunctionCallOutputBody::Text("file content".into()),
+                    success: None,
+                },
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ];
+        let req = make_request("", items, None);
+        let chat = from_responses_request(&req);
+
+        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(chat.messages[0].role, "tool");
+        assert_eq!(chat.messages[0].tool_call_id, Some("call_1".into()));
+        match &chat.messages[0].content {
+            ChatContent::Text(t) => assert_eq!(t, "file content"),
+            _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
+    fn custom_tool_call_output_becomes_tool_message() {
+        let items = vec![
+            ResponseItem::CustomToolCallOutput {
+                id: Some("ctco_1".into()),
+                call_id: "call_ctc".into(),
+                name: Some("ct".into()),
+                output: FunctionCallOutputPayload {
+                    body: FunctionCallOutputBody::Text("result".into()),
+                    success: None,
+                },
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ];
+        let req = make_request("", items, None);
+        let chat = from_responses_request(&req);
+
+        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(chat.messages[0].role, "tool");
+        assert_eq!(chat.messages[0].tool_call_id, Some("call_ctc".into()));
+        match &chat.messages[0].content {
+            ChatContent::Text(t) => assert_eq!(t, "result"),
+            _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
+    fn reasoning_content_merged_into_next_assistant() {
+        let items = vec![
+            ResponseItem::Reasoning {
+                id: Some("r_1".into()),
+                summary: vec![],
+                content: None,
+                encrypted_content: Some("thinking step 1...".into()),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::Message {
+                id: Some("msg_1".into()),
+                role: "assistant".into(),
+                content: vec![ContentItem::OutputText { text: "answer".into() }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ];
+        let req = make_request("", items, None);
+        let chat = from_responses_request(&req);
+
+        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(chat.messages[0].role, "assistant");
+        assert_eq!(chat.messages[0].reasoning_content, Some("thinking step 1...".into()));
+    }
+
+    #[test]
+    fn reasoning_merged_into_assistant_with_tool_call() {
+        let items = vec![
+            ResponseItem::Reasoning {
+                id: Some("r_1".into()),
+                summary: vec![],
+                content: None,
+                encrypted_content: Some("thinking...".into()),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::FunctionCall {
+                id: Some("fc_1".into()),
+                name: "read_file".into(),
+                namespace: None,
+                arguments: r#"{}"#.into(),
+                call_id: "call_1".into(),
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ];
+        let req = make_request("", items, None);
+        let chat = from_responses_request(&req);
+
+        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(chat.messages[0].role, "assistant");
+        // reasoning_content must be preserved when tool_calls follow reasoning
+        assert_eq!(chat.messages[0].reasoning_content, Some("thinking...".into()));
+        assert!(chat.messages[0].tool_calls.is_some());
+    }
+
+    #[test]
+    fn reasoning_without_following_assistant_is_dropped() {
+        let items = vec![
+            ResponseItem::Reasoning {
+                id: Some("r_1".into()),
+                summary: vec![],
+                content: None,
+                encrypted_content: Some("orphan thinking".into()),
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ];
+        let req = make_request("", items, None);
+        let chat = from_responses_request(&req);
+
+        // Reasoning without following assistant → dropped (pending_reasoning never consumed)
+        assert_eq!(chat.messages.len(), 0);
+    }
+
+    #[test]
+    fn reasoning_not_merged_into_non_assistant_message() {
+        let items = vec![
+            ResponseItem::Reasoning {
+                id: Some("r_1".into()),
+                summary: vec![],
+                content: None,
+                encrypted_content: Some("thinking".into()),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::Message {
+                id: Some("msg_1".into()),
+                role: "user".into(),
+                content: vec![ContentItem::InputText { text: "continue".into() }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ];
+        let req = make_request("", items, None);
+        let chat = from_responses_request(&req);
+
+        // Reasoning before a user message → reasoning dropped, user message present without reasoning
+        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(chat.messages[0].role, "user");
+        assert!(chat.messages[0].reasoning_content.is_none());
+    }
+
+    #[test]
+    fn tools_are_converted_from_flat_to_nested() {
+        let tools = Some(vec![
+            json!({
+                "name": "read_file",
+                "description": "Read a file",
+                "parameters": {"type": "object", "properties": {}}
+            }),
+            json!({
+                "name": "write_file",
+                "description": "Write a file",
+                "parameters": {"type": "object", "properties": {}}
+            }),
+        ]);
+        let req = make_request("Do it.", vec![], tools);
+        let chat = from_responses_request(&req);
+
+        let tools = chat.tools.as_ref().expect("expected tools");
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].r#type, "function");
+        assert_eq!(tools[0].function.name, "read_file");
+        assert_eq!(tools[1].function.name, "write_file");
+    }
+
+    #[test]
+    fn full_conversation_round_trip() {
+        // Simulate a complete tool-use conversation cycle
+        let items = vec![
+            // User asks a question
+            ResponseItem::Message {
+                id: Some("msg_u1".into()),
+                role: "user".into(),
+                content: vec![ContentItem::InputText { text: "Read the file".into() }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            },
+            // Assistant reasons and calls read_file
+            ResponseItem::Reasoning {
+                id: Some("r_1".into()),
+                summary: vec![],
+                content: None,
+                encrypted_content: Some("I need to read the file...".into()),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::FunctionCall {
+                id: Some("fc_1".into()),
+                name: "read_file".into(),
+                namespace: None,
+                arguments: r#"{"path":"test.txt"}"#.into(),
+                call_id: "call_rf".into(),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            // Tool returns result
+            ResponseItem::FunctionCallOutput {
+                id: Some("fco_1".into()),
+                call_id: "call_rf".into(),
+                output: FunctionCallOutputPayload {
+                    body: FunctionCallOutputBody::Text("file content".into()),
+                    success: None,
+                },
+                internal_chat_message_metadata_passthrough: None,
+            },
+            // Assistant responds based on tool output
+            ResponseItem::Message {
+                id: Some("msg_a1".into()),
+                role: "assistant".into(),
+                content: vec![ContentItem::OutputText { text: "Here is the content".into() }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ];
+
+        let req = make_request("You are a helpful assistant.", items, None);
+        let chat = from_responses_request(&req);
+
+        // Expected messages:
+        // [0] system
+        // [1] user
+        // [2] assistant (with reasoning_content + tool_calls)
+        // [3] tool
+        // [4] assistant (final response)
+        assert_eq!(chat.messages.len(), 5);
+
+        // [0] system
+        assert_eq!(chat.messages[0].role, "system");
+
+        // [1] user
+        assert_eq!(chat.messages[1].role, "user");
+        match &chat.messages[1].content {
+            ChatContent::Text(t) => assert_eq!(t, "Read the file"),
+            _ => panic!("expected Text"),
+        }
+
+        // [2] assistant with reasoning + tool call
+        assert_eq!(chat.messages[2].role, "assistant");
+        assert_eq!(chat.messages[2].reasoning_content, Some("I need to read the file...".into()));
+        let calls = chat.messages[2].tool_calls.as_ref().expect("expected tool_calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "read_file");
+
+        // [3] tool
+        assert_eq!(chat.messages[3].role, "tool");
+        assert_eq!(chat.messages[3].tool_call_id, Some("call_rf".into()));
+
+        // [4] assistant final
+        assert_eq!(chat.messages[4].role, "assistant");
+        match &chat.messages[4].content {
+            ChatContent::Text(t) => assert_eq!(t, "Here is the content"),
+            _ => panic!("expected Text"),
+        }
+        // No reasoning_content on the second assistant (no pending reasoning)
+        assert!(chat.messages[4].reasoning_content.is_none());
+    }
+
+    #[test]
+    fn serializes_to_valid_chat_json() {
+        // Verify the output can be serialized and looks like a valid Chat API request
+        let req = make_request("Be concise.", vec![
+            ResponseItem::Message {
+                id: Some("msg_u1".into()),
+                role: "user".into(),
+                content: vec![ContentItem::InputText { text: "Hello".into() }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ], None);
+        let chat = from_responses_request(&req);
+
+        let json_str = serde_json::to_string(&chat).expect("serialization failed");
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).expect("valid JSON");
+
+        assert_eq!(parsed["model"], "deepseek-v4-flash");
+        assert_eq!(parsed["stream"], true);
+        assert_eq!(parsed["tool_choice"], "auto");
+        assert_eq!(parsed["thinking"]["type"], "enabled");
+        assert_eq!(parsed["stream_options"]["include_usage"], true);
+        assert_eq!(parsed["messages"][0]["role"], "system");
+        assert_eq!(parsed["messages"][1]["role"], "user");
+        assert_eq!(parsed["messages"][1]["content"], "Hello");
     }
 }
